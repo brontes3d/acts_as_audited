@@ -19,6 +19,102 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+module ActsAsAudited
+  
+  def self.without_auditing(*models, &block)
+    to_call = block
+    models.each do |m| 
+      inner = to_call
+      to_call = Proc.new do 
+        m.without_auditing do
+          inner.call
+        end
+      end
+    end
+    to_call.call
+  end
+  
+  #
+  # Audit saves the changes to ActiveRecord models.  It has the following attributes:
+  #
+  # * <tt>auditable</tt>: the ActiveRecord model that was changed
+  # * <tt>user</tt>: the user that performed the change; a string or an ActiveRecord model
+  # * <tt>action</tt>: one of create, update, or delete
+  # * <tt>audit_changes</tt>: a serialized hash of all the audit_changes
+  # * <tt>created_at</tt>: Time that the change was performed
+  #
+  module Audit
+    def self.included(base)
+      base.class_eval do
+          belongs_to :auditable, :polymorphic => true
+          belongs_to :user, :polymorphic => true
+
+          before_create :set_version_number
+
+          serialize :audit_changes
+
+          cattr_accessor :audited_classes
+          self.audited_classes = []
+
+          # Allows user to be set to either a string or an ActiveRecord object
+          def user_as_string=(user) #:nodoc:
+            # reset both either way
+            self.user_as_model = self.username = nil
+            user.is_a?(ActiveRecord::Base) ?
+              self.user_as_model = user :
+              self.username = user
+          end
+          alias_method :user_as_model=, :user=
+          alias_method :user=, :user_as_string=
+
+          def user_as_string #:nodoc:
+            self.user_as_model || self.username
+          end
+          alias_method :user_as_model, :user
+          alias_method :user, :user_as_string
+
+          def revision
+            attributes = self.class.reconstruct_attributes(ancestors).merge({:version => version})
+            clazz = auditable_type.constantize
+            returning clazz.find_by_id(auditable_id) || clazz.new do |m|
+              m.attributes = attributes
+            end
+          end
+
+          def ancestors
+            self.class.find(:all, :order => 'version',
+              :conditions => ['auditable_id = ? and auditable_type = ? and version <= ?',
+              auditable_id, auditable_type, version])
+          end
+
+          def self.reconstruct_attributes(audits)
+            audit_changes = {}
+            result = audits.collect do |audit|
+              attributes = (audit.audit_changes || {}).inject({}) do |attrs, (name, (_,value))|
+                attrs[name] = value
+                attrs
+              end
+              audit_changes.merge!(attributes.merge!(:version => audit.version))
+              yield audit_changes if block_given?
+            end
+            block_given? ? result : audit_changes
+          end
+
+        protected
+        
+          def set_version_number
+            max = self.class.maximum(:version,
+              :conditions => {
+                :auditable_id => auditable_id,
+                :auditable_type => auditable_type
+              }) || 0
+            self.version = max + 1
+          end
+      end
+    end
+  end
+end
+
 module CollectiveIdea #:nodoc:
   module Acts #:nodoc:
     # Specify this act if you want changes to your model to be saved in an
@@ -31,7 +127,7 @@ module CollectiveIdea #:nodoc:
     # See <tt>CollectiveIdea::Acts::Audited::ClassMethods#acts_as_audited</tt>
     # for configuration options
     module Audited #:nodoc:
-      CALLBACKS = [:clear_changed_attributes, :audit_create, :audit_update, :audit_destroy]
+      CALLBACKS = [:audit_create, :audit_update, :audit_destroy]
 
       def self.included(base) # :nodoc:
         base.extend ClassMethods
@@ -52,19 +148,22 @@ module CollectiveIdea #:nodoc:
         #     end
         # 
         def acts_as_audited(options = {})
+          
           # don't allow multiple calls
           return if self.included_modules.include?(CollectiveIdea::Acts::Audited::InstanceMethods)
 
           include CollectiveIdea::Acts::Audited::InstanceMethods
           
           class_inheritable_reader :non_audited_columns
-          class_inheritable_reader :auditing_enabled
 
           except = [self.primary_key, inheritance_column, 'lock_version', 'created_at', 'updated_at']
           except |= [options[:except]].flatten.collect(&:to_s) if options[:except]
           write_inheritable_attribute :non_audited_columns, except
 
           class_eval do
+            cattr_accessor :auditing_enabled
+            self.auditing_enabled = true
+            
             extend CollectiveIdea::Acts::Audited::SingletonMethods
 
             has_many :audits, :as => :auditable, :order => 'audits.version desc'
@@ -74,21 +173,16 @@ module CollectiveIdea #:nodoc:
             after_create :audit_create
             after_update :audit_update
             after_destroy :audit_destroy
-            after_save :clear_changed_attributes
             
-            attr_accessor :version
-            
-            alias_method_chain :write_attribute, :auditing
-
-            write_inheritable_attribute :auditing_enabled, true
+            attr_accessor :version            
           end
         end
       end
     
       module InstanceMethods
         
-        def changed_attributes
-          @changed_attributes ||= {}
+        def audit_changed_attributes
+          excepted_changes
         end
         
         # Temporarily turns off auditing while saving.
@@ -101,12 +195,6 @@ module CollectiveIdea #:nodoc:
           self.attributes.keys.select { |k| !self.non_audited_columns.include?(k) }
         end
         
-        # If called with no parameters, gets whether the current model has changed.
-        # If called with a single parameter, gets whether the parameter has changed.
-        def changed?(attr_name = nil)
-          attr_name ? changed_attributes.include?(attr_name.to_s) : !changed_attributes.empty?
-        end
-
         # Executes the block with the auditing callbacks disabled.
         #
         #   @foo.without_auditing do
@@ -125,34 +213,50 @@ module CollectiveIdea #:nodoc:
         #   end
         #
         def revisions(from_version = 1)
-          changes(from_version) {|attributes| revision_with(attributes) }
+          audit_changes(from_version) {|attributes| revision_with(attributes) }
         end
         
         # Get a specific revision
         def revision(version)
-          revision_with changes(version)
+          revision_with audit_changes(version)
         end
         
         def revision_at(date_or_time)
           audit = audits.find(:first, :conditions => ["created_at <= ?", date_or_time],
             :order => "created_at DESC")
-          revision_with changes(audit.version) if audit
+          revision_with audit_changes(audit.version) if audit
         end
+        
+        # If called with no parameters, gets whether the current model has changed.
+        # If called with a single parameter, gets whether the parameter has changed.
+        def audit_changed?(attr_name = nil)
+          attr_name ? excepted_changes[attr_name.to_s] : !excepted_changes.empty?
+        end
+        
+        def excepted_changes
+          excepted_changes = {}
+          self.changes.each do |key,value|
+            unless non_audited_columns.include?(key)
+              excepted_changes[key] = value
+            end
+          end
+          excepted_changes
+        end        
 
       private
       
-        def changes(from_version = 1)
+        def audit_changes(from_version = 1)
           from_version = audits.find(:first).version if from_version == :previous
-          changes = {}
+          audit_changes = {}
           result = audits.find(:all, :conditions => ['version >= ?', from_version]).collect do |audit|
-            attributes = (audit.changes || {}).inject({}) do |attrs, (name, values)|
+            attributes = (audit.audit_changes || {}).inject({}) do |attrs, (name, values)|
               attrs[name] = values.first
               attrs
             end
-            changes.merge!(attributes.merge!(:version => audit.version))
-            yield changes if block_given?
+            audit_changes.merge!(attributes.merge!(:version => audit.version))
+            yield audit_changes if block_given?
           end
-          block_given? ? result : changes
+          block_given? ? result : audit_changes
         end
         
         def revision_with(attributes)
@@ -164,48 +268,30 @@ module CollectiveIdea #:nodoc:
         
         # Creates a new record in the audits table if applicable
         def audit_create
-          write_audit(:create)
+          if self.class.auditing_enabled
+            write_audit(:create)
+          end
+          true
         end
 
         def audit_update
-          write_audit(:update) if changed?
+          if self.class.auditing_enabled
+            write_audit(:update) if audit_changed?
+          end
+          true
         end
 
         def audit_destroy
-          write_audit(:destroy)
-        end
-      
-        def write_audit(action = :update, user = nil)
-          self.audits.create :changes => changed_attributes, :action => action.to_s, :user => user
-        end
-
-        # clears current changed attributes.  Called after save.
-        def clear_changed_attributes
-          @changed_attributes = {}
-        end
-        
-        # overload write_attribute to save changes to audited attributes
-        def write_attribute_with_auditing(attr_name, attr_value)
-          attr_name = attr_name.to_s
-          if audited_attributes.include?(attr_name)
-            # get original value
-            old_value = changed_attributes[attr_name] ?
-              changed_attributes[attr_name].first : self[attr_name]
-            write_attribute_without_auditing(attr_name, attr_value)
-            new_value = self[attr_name]
-            
-            changed_attributes[attr_name] = [old_value, new_value] if new_value != old_value
-          else
-            write_attribute_without_auditing(attr_name, attr_value)
+          if self.class.auditing_enabled
+            write_audit(:destroy)
           end
-        end
-
-        CALLBACKS.each do |attr_name| 
-          alias_method "orig_#{attr_name}".to_sym, attr_name
+          true
         end
         
-        def empty_callback() end #:nodoc:
-
+        def write_audit(action = :update, user = nil)
+          self.audits.create :audit_changes => excepted_changes, :action => action.to_s, :user => user
+        end
+        
       end # InstanceMethods
       
       module SingletonMethods
@@ -223,25 +309,17 @@ module CollectiveIdea #:nodoc:
         def without_auditing(&block)
           auditing_was_enabled = auditing_enabled
           disable_auditing
-          returning(block.call) { enable_auditing if auditing_was_enabled }
+          block.call
+        ensure
+          enable_auditing if auditing_was_enabled
         end
         
         def disable_auditing
-          class_eval do 
-            CALLBACKS.each do |attr_name| 
-              alias_method attr_name, :empty_callback
-            end
-          end
-          write_inheritable_attribute :auditing_enabled, false
+          self.auditing_enabled = false
         end
         
         def enable_auditing
-          class_eval do 
-            CALLBACKS.each do |attr_name|
-              alias_method attr_name, "orig_#{attr_name}".to_sym
-            end
-          end
-          write_inheritable_attribute :auditing_enabled, true
+          self.auditing_enabled = true
         end
 
       end

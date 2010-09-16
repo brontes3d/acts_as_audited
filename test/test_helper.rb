@@ -3,21 +3,25 @@ $:.unshift(File.dirname(__FILE__) + '/../lib')
 require 'test/unit'
 require 'rubygems'
 require 'active_record'
+
 require File.dirname(__FILE__) + '/../init.rb'
+require 'audit'
 
 require 'active_record/fixtures'
 
-config = YAML::load(IO.read(File.dirname(__FILE__) + '/database.yml'))
-ActiveRecord::Base.logger = Logger.new(File.dirname(__FILE__) + "/debug.log")
-ActiveRecord::Base.establish_connection(config[ENV['DB'] || 'sqlite3'])
+
+# ActiveRecord::Base.logger = Logger.new(File.dirname(__FILE__) + "/debug.log")
+ActiveRecord::Base.establish_connection(:adapter => "sqlite3", :dbfile => ":memory:")
 
 load(File.dirname(__FILE__) + "/schema.rb")
 
 Test::Unit::TestCase.fixture_path = File.dirname(__FILE__) + "/fixtures/"
 $LOAD_PATH.unshift(Test::Unit::TestCase.fixture_path)
 
+require File.expand_path(File.dirname(__FILE__) + '/../../field_defs/init')
+
 # load model
-require File.join(File.dirname(__FILE__), 'fixtures/user')
+require File.join(File.dirname(__FILE__), 'fixtures/models.rb')
 
 class Test::Unit::TestCase #:nodoc:
   def create_fixtures(*table_names)

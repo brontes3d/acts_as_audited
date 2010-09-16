@@ -8,7 +8,7 @@ class ActsAsAuditedTest < Test::Unit::TestCase
     end
 
     u = User.new
-    [:audits, :save_without_auditing, :without_auditing, :audited_attributes, :changed?].each do |m|
+    [:audits, :save_without_auditing, :without_auditing, :audited_attributes, :audit_changed?].each do |m|
       assert u.respond_to?(m), "User object should respond to #{m}."
     end
   end
@@ -25,9 +25,9 @@ class ActsAsAuditedTest < Test::Unit::TestCase
 
   def test_doesnt_save_non_audited_columns
     u = create_user
-    assert !u.audits.first.changes.include?('created_at'), 'created_at should not be audited'
-    assert !u.audits.first.changes.include?('updated_at'), 'updated_at should not be audited'
-    assert !u.audits.first.changes.include?('password'), 'password should not be audited'
+    assert !u.audits.first.audit_changes.include?('created_at'), 'created_at should not be audited'
+    assert !u.audits.first.audit_changes.include?('updated_at'), 'updated_at should not be audited'
+    assert !u.audits.first.audit_changes.include?('password'), 'password should not be audited'
   end
   
   def test_save_audit
@@ -51,20 +51,20 @@ class ActsAsAuditedTest < Test::Unit::TestCase
     end
   end
   
-  def test_changed?
+  def test_audit_changed?
     u = create_user
-    assert !u.changed?
+    assert !u.audit_changed?
     u.name = "Bobby"
-    assert u.changed?
-    assert u.changed?(:name)
-    assert !u.changed?(:username)
+    assert u.audit_changed?
+    assert u.audit_changed?(:name)
+    assert !u.audit_changed?(:username)
   end
   
   def test_clears_changed_attributes_after_save
     u = User.new(:name => 'Brandon')
-    assert u.changed?
+    assert u.audit_changed?
     u.save
-    assert !u.changed?
+    assert !u.audit_changed?
   end
   
   def test_type_casting
@@ -78,14 +78,14 @@ class ActsAsAuditedTest < Test::Unit::TestCase
   def test_that_changes_is_a_hash
     u = create_user
     audit = Audit.find(u.audits.first.id)
-    assert audit.changes.is_a?(Hash)
+    assert audit.audit_changes.is_a?(Hash)
   end
   
   def test_save_without_modifications
     u = create_user
     u.reload
     assert_nothing_raised do
-      assert !u.changed?
+      assert !u.audit_changed?
       u.save!
     end
   end
@@ -144,7 +144,7 @@ class ActsAsAuditedTest < Test::Unit::TestCase
   
   def test_revision_marks_attributes_changed
     u = create_versions(2)
-    assert u.revision(1).changed?(:name)
+    assert u.revision(1).audit_changed?(:name)
   end
 
   def test_save_revision_records_audit

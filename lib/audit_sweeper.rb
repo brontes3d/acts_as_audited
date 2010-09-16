@@ -52,11 +52,7 @@ class AuditSweeper < ActionController::Caching::Sweeper #:nodoc:
   def after_update(record)
     record.send(:write_audit, :update, current_user)
   end
-  
-  def after_save(record)
-    record.send(:clear_changed_attributes)
-  end
-  
+    
   def current_user
     controller.send :current_user if controller.respond_to?(:current_user)
   end

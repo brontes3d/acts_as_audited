@@ -1,4 +1,4 @@
-require 'audit'
+$:.unshift "#{File.dirname(__FILE__)}/lib"
 require 'acts_as_audited'
 
 ActiveRecord::Base.send :include, CollectiveIdea::Acts::Audited
